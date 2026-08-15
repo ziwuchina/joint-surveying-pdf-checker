@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.edb
+*.pdf
+*.bak
+_edb_backup_*/
+backup_v*/
