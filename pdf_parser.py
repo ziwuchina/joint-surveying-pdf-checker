@@ -166,11 +166,12 @@ def _parse_area_summary_tables(doc, keyword, page_offset=3):
                         continue
                     if ci in bldg_cols:
                         continue
-                    if cell in sub_cat_labels:
+                    cell_clean = cell.replace('\n', '').replace(' ', '')
+                    if cell_clean in sub_cat_labels or cell_clean == "分项面积":
                         continue
                     if re.match(r'^[\d.]+$', cell):
                         continue
-                    sub_label = cell
+                    sub_label = cell_clean
                     break
 
                 if sub_label:
@@ -197,6 +198,17 @@ def _parse_area_summary_tables(doc, keyword, page_offset=3):
                     elif current_cat == "far":
                         setattr(bld.far_area, sub, num_val)
                     elif current_cat == "subitem":
+                        # 分项名称因项目而异：以表格实际识别到的名称作为唯一键
+                        item_label = (sub_label or current_sub_label or
+                                      current_sub_cat or "未命名分项")
+                        item_key = re.sub(r"\s+", "", item_label.replace("\n", ""))
+                        if not item_key or item_key in {"分项面积", "小计", "合计", "总计"}:
+                            continue
+                        item = bld.subitems.setdefault(item_key, AreaItem())
+                        old_value = getattr(item, sub)
+                        setattr(item, sub, num_val if old_value is None else old_value + num_val)
+
+                        # 保留旧字段供兼容
                         cat = _categorize_subitem(sub_label) if sub_label else current_sub_cat or "other"
                         if cat == "main" or current_sub_cat == "main":
                             setattr(bld.main_function, sub, num_val)
@@ -206,14 +218,13 @@ def _parse_area_summary_tables(doc, keyword, page_offset=3):
                             setattr(bld.facility, sub, num_val)
                         elif cat == "basement":
                             setattr(bld.basement, sub, num_val)
-                        else:
-                            if bld.main_function.__getattribute__(sub) is None:
-                                setattr(bld.main_function, sub, num_val)
-                            else:
-                                if bld.facility.__getattribute__(sub) is None:
-                                    setattr(bld.facility, sub, num_val)
-                                else:
-                                    setattr(bld.facility, sub, num_val + (bld.facility.__getattribute__(sub) or Decimal("0")))
+
+    # "分项面积"是表格节标题被误当作分项名称，实际代表主要功能面积
+    for bld in buildings:
+        if "分项面积" in bld.subitems and "主要功能" not in bld.subitems:
+            item = bld.subitems.pop("分项面积")
+            bld.subitems["主要功能"] = item
+            bld.main_function = item
 
     return buildings
 
@@ -244,24 +255,77 @@ def parse_building_area_summary(doc):
 
             in_subitem = False
             current_far_cat = None
+            current_sub_label = None
             for row in data[1:]:
                 row_texts = [_row_str(row, ci) for ci in range(len(row))]
                 row_joined = " ".join(row_texts)
 
+                # "分项面积"行可能同时包含第一个分项数据（主要功能+厂房+许可+值）
+                # 不能直接continue跳过
                 if "分项" in row_joined and "面积" in row_joined:
                     in_subitem = True
-                    continue
+                    current_sub_label = None
+                    # 不continue，继续处理该行的数据
                 if "计容面积" in row_joined and "分项" not in row_joined:
                     in_subitem = False
                     current_far_cat = "far"
+                    current_sub_label = None
                 elif "基底面积" in row_joined:
+                    in_subitem = False
                     current_far_cat = "base"
-
-                if in_subitem:
-                    continue
+                    current_sub_label = None
+                elif "主要功能" in row_joined:
+                    current_sub_label = "主要功能"
+                elif "其它项目" in row_joined or "其他项目" in row_joined:
+                    current_sub_label = "其他项目"
 
                 sub = _detect_sub_type(row_joined)
                 if not sub:
+                    continue
+
+                sub_label = ""
+                for ci in range(len(row)):
+                    cell = _row_str(row, ci)
+                    if not cell:
+                        continue
+                    if cell in ("许可", "测量", "饰面"):
+                        continue
+                    if ci in bldg_cols:
+                        continue
+                    cell_clean = cell.replace('\n', '').replace(' ', '')
+                    if cell_clean in ("主要功能", "其它项目", "其他项目", "分项面积"):
+                        continue
+                    if re.match(r'^[\d.]+$', cell):
+                        continue
+                    sub_label = cell_clean
+                    break
+
+                if sub_label:
+                    current_sub_label = sub_label
+                else:
+                    sub_label = current_sub_label or ""
+
+                if in_subitem:
+                    for ci, bldg_name in bldg_cols.items():
+                        val_str = _row_str(row, ci)
+                        if not val_str:
+                            continue
+                        num_val = d(val_str)
+                        if num_val is None:
+                            continue
+
+                        bld = next((b for b in buildings if b.name == bldg_name), None)
+                        if not bld:
+                            continue
+
+                        item_label = sub_label or "未命名分项"
+                        item_key = re.sub(r"\s+", "", item_label.replace("\n", ""))
+                        if not item_key or item_key in {"分项面积", "小计", "合计", "总计"}:
+                            continue
+                        item = bld.far_subitems.setdefault(item_key, AreaItem())
+                        old_value = getattr(item, sub)
+                        setattr(item, sub, num_val if old_value is None else old_value + num_val)
+
                     continue
 
                 for ci, bldg_name in bldg_cols.items():
@@ -280,6 +344,12 @@ def parse_building_area_summary(doc):
                         setattr(bld.base_area, sub, num_val)
                     elif current_far_cat == "far":
                         setattr(bld.far_area, sub, num_val)
+
+    # "分项面积"重命名同样适用于计容面积分项
+    for bld in buildings:
+        if "分项面积" in bld.far_subitems and "主要功能" not in bld.far_subitems:
+            item = bld.far_subitems.pop("分项面积")
+            bld.far_subitems["主要功能"] = item
 
     return buildings
 
@@ -530,6 +600,13 @@ def parse_floor_area_tables(doc):
 
 def _extract_building_name_from_page(page_text):
     """从页面文本中提取建筑名称"""
+    # 优先识别"新智园X栋/幢"等通用栋号模式
+    m = re.search(r'(新智园\s*\d+\s*栋)', page_text)
+    if m:
+        return m.group(1).replace(' ', '')
+    m = re.search(r'([\u4e00-\u9fa5]{1,6}\d+栋)', page_text)
+    if m:
+        return m.group(1)
     name_patterns = [
         r'(厂房[一二三四五六七八九十]+)',
         r'(地下室)',
@@ -566,6 +643,13 @@ def _extract_building_name_from_page(page_text):
 
 def _extract_building_name_from_title(text):
     """从表格标题行提取建筑名称（如'厂房二分摊说明'→'厂房二'）"""
+    # 优先识别"新智园X栋分摊"模式
+    m = re.search(r'(新智园\s*\d+\s*栋)\s*分摊', text)
+    if m:
+        return m.group(1).replace(' ', '')
+    m = re.search(r'([\u4e00-\u9fa5]{1,6}\d+栋)\s*分摊', text)
+    if m:
+        return m.group(1)
     patterns = [
         r'(厂房[一二三四五六七八九十]+)分摊',
         r'(地下室)分摊',

@@ -14,6 +14,14 @@ def d(val) -> Optional[Decimal]:
         return None
 
 
+def normalize_building_name(name: str) -> str:
+    """统一建筑名称，作为跨表关联的唯一键。"""
+    if not name:
+        return ""
+    value = str(name).replace("\u3000", "").replace(" ", "").replace("\n", "")
+    return value.replace("幢", "栋").replace("號", "号")
+
+
 @dataclass
 class AreaItem:
     permitted: Optional[Decimal] = None
@@ -31,37 +39,58 @@ class BuildingArea:
     roof_stair: AreaItem = field(default_factory=AreaItem)
     facility: AreaItem = field(default_factory=AreaItem)
     basement: AreaItem = field(default_factory=AreaItem)
+    # 使用表格实际出现的分项名称作为键，避免依赖固定的分项字段。
+    subitems: dict = field(default_factory=dict)
+    # 计容面积汇总表有自己的分项区块，单独存储。
+    far_subitems: dict = field(default_factory=dict)
     summary_page: int = -1
 
+    def _all_subitems(self):
+        if self.subitems:
+            return self.subitems.values()
+        return (self.main_function, self.roof_stair, self.facility, self.basement)
+
+    def _all_far_subitems(self):
+        if self.far_subitems:
+            return self.far_subitems.values()
+        if self.subitems:
+            return self.subitems.values()
+        return (self.main_function, self.roof_stair, self.facility, self.basement)
+
     def subitem_sum_measured(self) -> Optional[Decimal]:
-        parts = [self.main_function.measured, self.roof_stair.measured,
-                 self.facility.measured, self.basement.measured]
-        valid = [p for p in parts if p is not None]
-        if not valid:
+        vals = [item.measured for item in self._all_subitems()
+                if item.measured is not None]
+        if not vals:
             return None
-        return sum(valid, Decimal("0"))
+        return sum(vals, Decimal("0"))
 
     def subitem_sum_permitted(self) -> Optional[Decimal]:
-        parts = [self.main_function.permitted, self.roof_stair.permitted,
-                 self.facility.permitted, self.basement.permitted]
-        valid = [p for p in parts if p is not None]
-        if not valid:
+        vals = [item.permitted for item in self._all_subitems()
+                if item.permitted is not None]
+        if not vals:
             return None
-        return sum(valid, Decimal("0"))
+        return sum(vals, Decimal("0"))
 
     def subitem_sum_finishing(self) -> Optional[Decimal]:
-        parts = [self.main_function.finishing, self.roof_stair.finishing, self.facility.finishing]
-        valid = [p for p in parts if p is not None]
-        if not valid:
+        vals = [item.finishing for item in self._all_subitems()
+                if item.finishing is not None]
+        if not vals:
             return None
-        return sum(valid, Decimal("0"))
+        return sum(vals, Decimal("0"))
 
     def far_subitem_sum_measured(self) -> Optional[Decimal]:
-        parts = [self.main_function.measured, self.facility.measured]
-        valid = [p for p in parts if p is not None]
-        if not valid:
+        vals = [item.measured for item in self._all_far_subitems()
+                if item.measured is not None]
+        if not vals:
             return None
-        return sum(valid, Decimal("0"))
+        return sum(vals, Decimal("0"))
+
+    def far_subitem_sum_permitted(self) -> Optional[Decimal]:
+        vals = [item.permitted for item in self._all_far_subitems()
+                if item.permitted is not None]
+        if not vals:
+            return None
+        return sum(vals, Decimal("0"))
 
 
 @dataclass

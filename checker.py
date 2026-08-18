@@ -1,5 +1,5 @@
 from decimal import Decimal
-from models import CheckResult, TOL
+from models import CheckResult, TOL, normalize_building_name, AreaItem
 
 FLOOR_TOL = Decimal("0.5")
 
@@ -16,9 +16,41 @@ def _fmt(val):
     return f"{val:.2f}"
 
 
-def _fmt_parts(parts):
-    """格式化加法算式，如 '25070.39 + 231.52 + 92.02'"""
-    return " + ".join(_fmt(p) for p in parts)
+def _dynamic_subitems(building):
+    """返回建筑面积汇总表的全部(name, AreaItem)对。"""
+    if building.subitems:
+        return list(building.subitems.items())
+    return [
+        ("主要功能", building.main_function),
+        ("屋面梯屋", building.roof_stair),
+        ("配套设施", building.facility),
+        ("地下室", building.basement),
+    ]
+
+
+def _dynamic_subitem_parts(building, value_name):
+    """返回有值的(name, value)对。"""
+    return [
+        (name, getattr(item, value_name))
+        for name, item in _dynamic_subitems(building)
+        if getattr(item, value_name) is not None
+    ]
+
+
+def _dynamic_far_subitems(building):
+    """返回计容面积汇总表的全部(name, AreaItem)对。"""
+    if building.far_subitems:
+        return list(building.far_subitems.items())
+    return _dynamic_subitems(building)
+
+
+def _dynamic_far_subitem_parts(building, value_name):
+    """返回计容分项中有值的(name, value)对。"""
+    return [
+        (name, getattr(item, value_name))
+        for name, item in _dynamic_far_subitems(building)
+        if getattr(item, value_name) is not None
+    ]
 
 
 def check_vertical(report):
@@ -29,16 +61,7 @@ def check_vertical(report):
         # --- 测量值 ---
         sub_measured = b.subitem_sum_measured()
         if sub_measured is not None and b.total_area.measured is not None:
-            parts = []
-            if b.main_function.measured is not None:
-                parts.append(("主要功能", b.main_function.measured))
-            if b.roof_stair.measured is not None:
-                parts.append(("屋面梯屋", b.roof_stair.measured))
-            if b.facility.measured is not None:
-                parts.append(("配套设施", b.facility.measured))
-            if b.basement.measured is not None:
-                parts.append(("地下室", b.basement.measured))
-
+            parts = _dynamic_subitem_parts(b, "measured")
             calc_str = " + ".join(f"{name}({_fmt(val)})" for name, val in parts)
             calc_str += f" = {_fmt(sub_measured)}"
 
@@ -61,16 +84,7 @@ def check_vertical(report):
         # --- 许可值 ---
         sub_permitted = b.subitem_sum_permitted()
         if sub_permitted is not None and b.total_area.permitted is not None:
-            parts = []
-            if b.main_function.permitted is not None:
-                parts.append(("主要功能", b.main_function.permitted))
-            if b.roof_stair.permitted is not None:
-                parts.append(("屋面梯屋", b.roof_stair.permitted))
-            if b.facility.permitted is not None:
-                parts.append(("配套设施", b.facility.permitted))
-            if b.basement.permitted is not None:
-                parts.append(("地下室", b.basement.permitted))
-
+            parts = _dynamic_subitem_parts(b, "permitted")
             calc_str = " + ".join(f"{name}({_fmt(val)})" for name, val in parts)
             calc_str += f" = {_fmt(sub_permitted)}"
 
@@ -90,15 +104,11 @@ def check_vertical(report):
                     f"建筑面积汇总表 {b.name}", b.summary_page,
                     calc_process=calc_str + f" = 总面积许可({_fmt(b.total_area.permitted)})"))
 
-        # --- 计容面积 ---
+        # --- 计容面积（使用far_subitems） ---
         if b.far_area.measured is not None:
             far_sub = b.far_subitem_sum_measured()
             if far_sub is not None:
-                parts = []
-                if b.main_function.measured is not None:
-                    parts.append(("主要功能", b.main_function.measured))
-                if b.facility.measured is not None:
-                    parts.append(("配套设施", b.facility.measured))
+                parts = _dynamic_far_subitem_parts(b, "measured")
                 calc_str = " + ".join(f"{name}({_fmt(val)})" for name, val in parts)
                 calc_str += f" = {_fmt(far_sub)}"
 
@@ -117,6 +127,30 @@ def check_vertical(report):
                         f"差额 0.00㎡",
                         f"计容面积汇总表 {b.name}", b.summary_page,
                         calc_process=calc_str + f" = 计容面积({_fmt(b.far_area.measured)})"))
+
+        # --- 计容面积许可值 ---
+        if b.far_area.permitted is not None:
+            far_sub_p = b.far_subitem_sum_permitted()
+            if far_sub_p is not None:
+                parts = _dynamic_far_subitem_parts(b, "permitted")
+                calc_str = " + ".join(f"{name}({_fmt(val)})" for name, val in parts)
+                calc_str += f" = {_fmt(far_sub_p)}"
+
+                if not _approx_eq(far_sub_p, b.far_area.permitted):
+                    diff = far_sub_p - b.far_area.permitted
+                    results.append(CheckResult(
+                        "竖向-计容面积汇总表", f"{b.name} 分项合计(许可)≠计容面积(许可)",
+                        "fail", _fmt(b.far_area.permitted), _fmt(far_sub_p),
+                        f"差额 {diff:+.2f}㎡",
+                        f"计容面积汇总表 {b.name}", b.summary_page,
+                        calc_process=calc_str + f" ≠ 计容面积许可({_fmt(b.far_area.permitted)})"))
+                else:
+                    results.append(CheckResult(
+                        "竖向-计容面积汇总表", f"{b.name} 分项合计(许可)=计容面积(许可)",
+                        "pass", _fmt(b.far_area.permitted), _fmt(far_sub_p),
+                        f"差额 0.00㎡",
+                        f"计容面积汇总表 {b.name}", b.summary_page,
+                        calc_process=calc_str + f" = 计容面积许可({_fmt(b.far_area.permitted)})"))
 
     # ===== 分层面积表：逐层合计 = 总计 =====
     for ft in report.floor_tables:
@@ -266,16 +300,23 @@ def check_horizontal(report):
                         calc_str, page_num=ft.summary_page, calc_process=calc_str))
 
             if ft.total_shared_public is not None and ut.total_shared is not None:
-                calc_str = f"分层表总分摊公建={_fmt(ft.total_shared_public)} vs 单元表分摊合计={_fmt(ut.total_shared)}"
-                if not _approx_eq(ft.total_shared_public, ut.total_shared, tol=FLOOR_TOL):
+                # 地下室等建筑常把所有公建记为"不分摊公建"（总分摊公建=0），
+                # 但实际参与分摊，此时用不分摊公建口径与单元表分摊合计比较
+                shared_ref = ft.total_shared_public
+                shared_label = "分层表总分摊公建"
+                if abs(shared_ref) <= TOL and ft.total_unshared_public is not None:
+                    shared_ref = ft.total_unshared_public
+                    shared_label = "分层表不分摊公建(参与分摊)"
+                calc_str = f"{shared_label}={_fmt(shared_ref)} vs 单元表分摊合计={_fmt(ut.total_shared)}"
+                if not _approx_eq(shared_ref, ut.total_shared, tol=FLOOR_TOL):
                     results.append(CheckResult(
                         "横向-分层vs单元", f"{ft.building_name} 分层总分摊公建≠单元分摊合计",
-                        "fail", _fmt(ft.total_shared_public), _fmt(ut.total_shared),
+                        "fail", _fmt(ut.total_shared), _fmt(shared_ref),
                         calc_str, page_num=ft.summary_page, calc_process=calc_str))
                 else:
                     results.append(CheckResult(
                         "横向-分层vs单元", f"{ft.building_name} 分层总分摊公建=单元分摊合计",
-                        "pass", _fmt(ft.total_shared_public), _fmt(ut.total_shared),
+                        "pass", _fmt(ut.total_shared), _fmt(shared_ref),
                         calc_str, page_num=ft.summary_page, calc_process=calc_str))
 
         # --- 分层表 vs 汇总表 ---
@@ -322,26 +363,41 @@ def check_horizontal(report):
                         calc_str, page_num=ap.page, calc_process=calc_str))
 
             if compare_shared is not None and ft.total_shared_public is not None:
-                calc_str = f"分摊说明分摊={_fmt(compare_shared)} vs 分层表分摊公建={_fmt(ft.total_shared_public)}"
-                if not _approx_eq(compare_shared, ft.total_shared_public, tol=FLOOR_TOL):
+                # 地下室等建筑常把所有公建记为"不分摊公建"（总分摊公建=0），
+                # 但分摊说明按参与分摊口径列出，此时用不分摊公建比较
+                shared_ref = ft.total_shared_public
+                shared_label = "分层表分摊公建"
+                if abs(shared_ref) <= TOL and ft.total_unshared_public is not None:
+                    shared_ref = ft.total_unshared_public
+                    shared_label = "分层表不分摊公建(参与分摊)"
+                calc_str = f"分摊说明分摊={_fmt(compare_shared)} vs {shared_label}={_fmt(shared_ref)}"
+                if not _approx_eq(compare_shared, shared_ref, tol=FLOOR_TOL):
                     results.append(CheckResult(
                         "横向-分摊说明vs分层", f"{ft.building_name} 分摊说明总分摊≠分层总分摊公建",
-                        "fail", _fmt(ft.total_shared_public), _fmt(compare_shared),
+                        "fail", _fmt(shared_ref), _fmt(compare_shared),
                         calc_str, page_num=ap.page, calc_process=calc_str))
                 else:
                     results.append(CheckResult(
                         "横向-分摊说明vs分层", f"{ft.building_name} 分摊说明总分摊=分层总分摊公建",
-                        "pass", _fmt(ft.total_shared_public), _fmt(compare_shared),
+                        "pass", _fmt(shared_ref), _fmt(compare_shared),
                         calc_str, page_num=ap.page, calc_process=calc_str))
 
             if compare_building is not None and ft.total_building is not None:
                 expected_building = compare_building
                 calc_str = f"分摊说明总建筑={_fmt(compare_building)}"
-                if ft.total_unshared_public is not None:
+                # 厂房等建筑：分摊说明总建筑不含"不分摊公建"，需叠加；
+                # 地下室等建筑：分摊说明总建筑已含全部公建（总分摊公建=0），不再叠加
+                shared_is_zero = (
+                    ft.total_shared_public is not None
+                    and abs(ft.total_shared_public) <= TOL
+                )
+                if (ft.total_unshared_public is not None
+                        and abs(ft.total_unshared_public) > TOL
+                        and not shared_is_zero):
                     expected_building += ft.total_unshared_public
                     calc_str += f" + 不分摊公建({_fmt(ft.total_unshared_public)})"
                 calc_str += f" = {_fmt(expected_building)} vs 分层总建筑={_fmt(ft.total_building)}"
-                if not _approx_eq(expected_building, ft.total_building, tol=FLOOR_TOL):
+                if not _approx_eq(expected_building, ft.total_building, tol=Decimal("1")):
                     results.append(CheckResult(
                         "横向-分摊说明vs分层", f"{ft.building_name} 分摊说明总建筑+不分摊公建≠分层总建筑",
                         "warning", _fmt(ft.total_building), _fmt(expected_building),
@@ -427,13 +483,9 @@ def check_permitted_vs_measured(report):
     ERROR_PCT = Decimal("5")
 
     for b in report.buildings:
-        items = [
-            ("总建筑面积", b.total_area),
-            ("主要功能", b.main_function),
-            ("屋面梯屋", b.roof_stair),
-            ("配套设施", b.facility),
-            ("地下室", b.basement),
-        ]
+        items = [("总建筑面积", b.total_area)]
+        for name, item in _dynamic_subitems(b):
+            items.append((name, item))
 
         for item_name, item in items:
             if item.permitted is not None and item.measured is not None:
@@ -507,8 +559,11 @@ def check_special(report):
 
     facilities = {}
     for b in report.buildings:
-        if b.facility.measured is not None and b.facility.measured > 0:
-            facilities[b.name] = b.facility.measured
+        for name, item in _dynamic_subitems(b):
+            if item.measured is not None and item.measured > 0:
+                if any(k in name for k in ["配套", "设施"]):
+                    facilities[b.name] = item.measured
+                    break
 
     if len(facilities) >= 2:
         for b in report.buildings:
@@ -522,14 +577,9 @@ def check_special(report):
                             matched_facility = fname
                             break
                     if matched_facility:
-                        parts = []
-                        if b.main_function.measured is not None:
-                            parts.append(f"主要功能({_fmt(b.main_function.measured)})")
-                        if b.roof_stair.measured is not None:
-                            parts.append(f"屋面({_fmt(b.roof_stair.measured)})")
-                        if b.facility.measured is not None:
-                            parts.append(f"配套({_fmt(b.facility.measured)})")
-                        calc_str = " + ".join(parts) + f" = {_fmt(sub_measured)}"
+                        parts = _dynamic_subitem_parts(b, "measured")
+                        calc_str = " + ".join(f"{name}({_fmt(val)})" for name, val in parts)
+                        calc_str += f" = {_fmt(sub_measured)}"
                         calc_str += f" ≠ 总面积({_fmt(b.total_area.measured)})"
                         calc_str += f"\n差额 {diff:+.2f}㎡ ≈ {matched_facility}配套设施({_fmt(facilities[matched_facility])}㎡)"
 
@@ -555,13 +605,19 @@ def generate_data_summary(report):
         lines.append(f"  基底面积: 许可={_fmt(b.base_area.permitted)}, 测量={_fmt(b.base_area.measured)}")
         lines.append(f"  总建筑面积: 许可={_fmt(b.total_area.permitted)}, 测量={_fmt(b.total_area.measured)}, 饰面={_fmt(b.total_area.finishing)}")
         lines.append(f"  计容面积: 许可={_fmt(b.far_area.permitted)}, 测量={_fmt(b.far_area.measured)}")
-        lines.append(f"  主要功能: 许可={_fmt(b.main_function.permitted)}, 测量={_fmt(b.main_function.measured)}")
-        lines.append(f"  屋面梯屋: 许可={_fmt(b.roof_stair.permitted)}, 测量={_fmt(b.roof_stair.measured)}")
-        lines.append(f"  配套设施: 许可={_fmt(b.facility.permitted)}, 测量={_fmt(b.facility.measured)}")
-        lines.append(f"  地下室: 许可={_fmt(b.basement.permitted)}, 测量={_fmt(b.basement.measured)}")
+        lines.append(f"  [建筑面积分项]")
+        for name, item in _dynamic_subitems(b):
+            lines.append(f"    {name}: 许可={_fmt(item.permitted)}, 测量={_fmt(item.measured)}")
         sub = b.subitem_sum_measured()
         if sub is not None:
-            lines.append(f"  → 分项合计(测量) = {_fmt(sub)}")
+            lines.append(f"  → 建筑面积分项合计(测量) = {_fmt(sub)}")
+        if b.far_subitems:
+            lines.append(f"  [计容面积分项]")
+            for name, item in b.far_subitems.items():
+                lines.append(f"    {name}: 许可={_fmt(item.permitted)}, 测量={_fmt(item.measured)}")
+            far_sub = b.far_subitem_sum_measured()
+            if far_sub is not None:
+                lines.append(f"  → 计容面积分项合计(测量) = {_fmt(far_sub)}")
 
     lines.append("\n" + "=" * 60)
     lines.append("二、分层面积表（提取数据）")
@@ -678,11 +734,15 @@ def check_edb_vs_pdf(pdf_report, edb_report):
             ("基底面积", edb_b.base_area, pdf_b.base_area),
             ("总建筑面积", edb_b.total_area, pdf_b.total_area),
             ("计容面积", edb_b.far_area, pdf_b.far_area),
-            ("主要功能", edb_b.main_function, pdf_b.main_function),
-            ("屋面梯屋", edb_b.roof_stair, pdf_b.roof_stair),
-            ("配套设施", edb_b.facility, pdf_b.facility),
-            ("地下室", edb_b.basement, pdf_b.basement),
         ]
+        edb_subs = dict(_dynamic_subitems(edb_b))
+        pdf_subs = dict(_dynamic_subitems(pdf_b))
+        all_sub_names = set(edb_subs.keys()) | set(pdf_subs.keys())
+        for name in sorted(all_sub_names):
+            edb_item = edb_subs.get(name)
+            pdf_item = pdf_subs.get(name)
+            if edb_item is not None or pdf_item is not None:
+                checks.append((name, edb_item or AreaItem(), pdf_item or AreaItem()))
 
         for item_name, edb_item, pdf_item in checks:
             for val_type, edb_val, pdf_val in [
@@ -912,16 +972,9 @@ def check_edb_internal(edb_report):
         if sub_measured is not None and b.total_area.measured is not None:
             if not _approx_eq(sub_measured, b.total_area.measured):
                 diff = sub_measured - b.total_area.measured
-                parts = []
-                if b.main_function.measured is not None:
-                    parts.append(f"主要功能({_fmt(b.main_function.measured)})")
-                if b.roof_stair.measured is not None:
-                    parts.append(f"屋面({_fmt(b.roof_stair.measured)})")
-                if b.facility.measured is not None:
-                    parts.append(f"配套({_fmt(b.facility.measured)})")
-                if b.basement.measured is not None:
-                    parts.append(f"地下室({_fmt(b.basement.measured)})")
-                calc_str = " + ".join(parts) + f" = {_fmt(sub_measured)}"
+                parts = _dynamic_subitem_parts(b, "measured")
+                calc_str = " + ".join(f"{name}({_fmt(val)})" for name, val in parts)
+                calc_str += f" = {_fmt(sub_measured)}"
                 calc_str += f" ≠ 总面积({_fmt(b.total_area.measured)})"
                 results.append(CheckResult(
                     "EDB内部一致性", f"{b.name} EDB分项合计(测量)≠总面积(测量)",
@@ -982,10 +1035,8 @@ def generate_edb_summary(edb_report):
         lines.append(f"  基底面积: 许可={_fmt(b.base_area.permitted)}, 测量={_fmt(b.base_area.measured)}")
         lines.append(f"  总建筑面积: 许可={_fmt(b.total_area.permitted)}, 测量={_fmt(b.total_area.measured)}, 饰面={_fmt(b.total_area.finishing)}")
         lines.append(f"  计容面积: 许可={_fmt(b.far_area.permitted)}, 测量={_fmt(b.far_area.measured)}")
-        lines.append(f"  主要功能: 许可={_fmt(b.main_function.permitted)}, 测量={_fmt(b.main_function.measured)}")
-        lines.append(f"  屋面梯屋: 许可={_fmt(b.roof_stair.permitted)}, 测量={_fmt(b.roof_stair.measured)}")
-        lines.append(f"  配套设施: 许可={_fmt(b.facility.permitted)}, 测量={_fmt(b.facility.measured)}")
-        lines.append(f"  地下室: 许可={_fmt(b.basement.permitted)}, 测量={_fmt(b.basement.measured)}")
+        for name, item in _dynamic_subitems(b):
+            lines.append(f"  {name}: 许可={_fmt(item.permitted)}, 测量={_fmt(item.measured)}")
         sub = b.subitem_sum_measured()
         if sub is not None:
             lines.append(f"  → 分项合计(测量) = {_fmt(sub)}")
