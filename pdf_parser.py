@@ -635,31 +635,56 @@ def parse_floor_area_tables(doc):
                 cells = [str(c).strip() if c else "" for c in row]
                 _parse_floor_detail_row(cells, existing, current_floor_ref)
 
-        for offset in range(1, 3):
+        for offset in range(1, 5):
             next_pidx = pidx + offset
             if next_pidx >= len(doc):
                 break
             next_text = doc[next_pidx].get_text()
-            if "分层汇总表" in next_text or "分层面积表" in next_text or "房产分层面积" in next_text:
+            if ("分层汇总表" in next_text or "分层面积表" in next_text
+                    or "房产分层面积" in next_text or "目录" in next_text):
                 break
-            if "总" in next_text and "面积" in next_text and "目录" not in next_text:
-                page_tables = _get_tables(doc, next_pidx)
-                for tab in page_tables:
-                    data = tab.extract()
-                    for row in data:
-                        cells = [str(c).strip() if c else "" for c in row]
-                        _parse_floor_detail_row(cells, existing, current_floor_ref)
+            # 中间页（只有层明细、不含"总"字）也需解析：仅当页面含面积数据才继续
+            if "平方米" not in next_text and "面积" not in next_text:
+                continue
+            page_tables = _get_tables(doc, next_pidx)
+            for tab in page_tables:
+                data = tab.extract()
+                for row in data:
+                    cells = [str(c).strip() if c else "" for c in row]
+                    _parse_floor_detail_row(cells, existing, current_floor_ref)
 
     return tables
 
 
 def _extract_building_name_from_page(page_text):
     """从页面文本中提取建筑名称"""
+    clean = page_text.replace('\n', '')
     # 优先识别"新智园X栋/幢"等通用栋号模式
-    m = re.search(r'(新智园\s*\d+\s*栋)', page_text)
+    m = re.search(r'(新智园\s*\d+\s*栋)', clean)
     if m:
         return m.group(1).replace(' ', '')
-    m = re.search(r'([\u4e00-\u9fa5]{1,6}\d+栋)', page_text)
+    # 从"XX分层面积表/分层汇总表"标题提取紧邻的栋号（允许中间含项目名汉字）
+    # 例："1号查验平台分层面积表" → "1号"
+    #     "庭5 栋分层面积表"   → "5栋"
+    #     "新智园1栋分层面积表" → "1栋"
+    # 优先栋/座/幢（避免"乐创路9 号"等地址中的"号"误判为栋号）
+    m = re.search(
+        r'([\d一二三四五六七八九十]+\s*(?:栋|座|幢))'
+        r'(?=[\u4e00-\u9fa5\s]*?(?:分层面积表|分层汇总表))',
+        clean)
+    if not m:
+        # X号 / X# 但前面不应是地址词（路/镇/村/社/大道/街/里）
+        m = re.search(
+            r'(?<![路镇村社大道街里])([\d一二三四五六七八九十]+\s*号|[0-9]+#)'
+            r'(?=[\u4e00-\u9fa5\s]*?(?:分层面积表|分层汇总表))',
+            clean)
+    if m:
+        return re.sub(r'\s+', '', m.group(1))
+    # "地下室三区分层汇总表"等无栋号命名
+    m = re.search(r'(地下室[一二三四五六七八九十\d]*区?)\s*(?:分层面积表|分层汇总表)', clean)
+    if m:
+        return m.group(1)
+    m = re.search(r'([\u4e00-\u9fa5]{1,6}\d+栋)', clean)
     if m:
         return m.group(1)
     name_patterns = [
@@ -702,6 +727,13 @@ def _extract_building_name_from_title(text):
     m = re.search(r'(新智园\s*\d+\s*栋)\s*分摊', text)
     if m:
         return m.group(1).replace(' ', '')
+    # 支持"XX1 栋分摊"/"XX1#分摊"/"地下室X区分摊"等
+    m = re.search(r'([\d一二三四五六七八九十]+\s*(?:栋|座|幢|号)|[0-9]+#)\s*分摊', text)
+    if m:
+        return re.sub(r'\s+', '', m.group(1))
+    m = re.search(r'(地下室[一二三四五六七八九十\d]*区?)\s*分摊', text)
+    if m:
+        return m.group(1)
     m = re.search(r'([\u4e00-\u9fa5]{1,6}\d+栋)\s*分摊', text)
     if m:
         return m.group(1)

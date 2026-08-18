@@ -855,9 +855,12 @@ def check_edb_vs_pdf(pdf_report, edb_report):
                         calc_process=f"EDB={_fmt(edb_val)} vs PDF={_fmt(pdf_val)} → 差额{diff:+.2f}㎡"))
 
     for edb_ft in edb_report.floor_tables:
+        edb_norm = normalize_building_name(edb_ft.building_name)
         pdf_ft = next(
             (ft for ft in pdf_report.floor_tables
-             if ft.building_name == edb_ft.building_name),
+             if normalize_building_name(ft.building_name) == edb_norm
+             or edb_norm in normalize_building_name(ft.building_name)
+             or normalize_building_name(ft.building_name) in edb_norm),
             None
         )
         edb_floor_count = len(edb_ft.floors)

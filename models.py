@@ -31,10 +31,11 @@ def normalize_building_name(name: str) -> str:
 
 
 def fuzzy_building_key(name: str) -> str:
-    """模糊匹配 key：在 normalize 基础上再去掉尾部量词（栋/座/幢/号楼），
-    使「13栋」「13座」「13 号」等不同命名可互相匹配。
+    """模糊匹配 key：在 normalize 基础上再去掉尾部量词（栋/座/幢/号楼/#），
+    使「13栋」「13座」「13 号」「13#」等不同命名可互相匹配。
     """
     value = normalize_building_name(name)
+    value = value.rstrip("#").rstrip("＃")
     for suffix in ("号楼", "栋", "座", "号", "幢"):
         if value.endswith(suffix) and len(value) > len(suffix):
             return value[:-len(suffix)]
