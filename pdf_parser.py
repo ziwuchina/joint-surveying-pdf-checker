@@ -3,7 +3,7 @@ import pymupdf
 from models import (
     d, BuildingArea, AreaItem, FloorArea, FloorAreaTable,
     UnitArea, UnitAreaTable, ApportionmentInfo, ApportionmentSource,
-    PlanningIndicators, ReportData,
+    PlanningIndicators, ReportData, normalize_building_name,
 )
 
 
@@ -81,17 +81,9 @@ def _detect_sub_type(row_joined):
 
 
 def _categorize_subitem(label):
-    """将分项面积子项分类"""
-    label_clean = label.replace('\n', '').replace(' ', '')
-    if any(k in label_clean for k in ["屋面", "屋顶", "梯屋", "机房"]):
-        return "roof"
-    if any(k in label_clean for k in ["配套", "消防", "水泵", "配电", "发电机", "开关站", "水池"]):
-        return "facility"
-    if "地下" in label_clean:
-        return "basement"
-    if any(k in label_clean for k in ["主要功能", "教育", "宿舍", "办公", "车间", "停车", "商业", "住宅"]):
-        return "main"
-    return "other"
+    """将分项面积子项分类（规则来自 rules.json 配置，可随项目覆盖）"""
+    from rules import get_subitem_category
+    return get_subitem_category(label)
 
 
 def _parse_area_summary_tables(doc, keyword, page_offset=3):
@@ -178,6 +170,28 @@ def _parse_area_summary_tables(doc, keyword, page_offset=3):
                     current_sub_label = sub_label
                 else:
                     sub_label = current_sub_label or ""
+
+                # 分项行功能名为建筑名（如"2 栋"）时，数值不按建筑分列、集中在一列，
+                # 直接赋给对应建筑，避免按列位置误分到其他建筑
+                if current_cat == "subitem" and sub_label:
+                    matched_bld = None
+                    for b in buildings:
+                        if normalize_building_name(b.name) == normalize_building_name(sub_label):
+                            matched_bld = b
+                            break
+                    if matched_bld:
+                        num_val = None
+                        for ci in range(len(row)):
+                            v = d(_row_str(row, ci))
+                            if v is not None:
+                                num_val = v
+                                break
+                        if num_val is not None:
+                            item_key = re.sub(r"\s+", "", sub_label.replace("\n", ""))
+                            if item_key:
+                                item = matched_bld.subitems.setdefault(item_key, AreaItem())
+                                setattr(item, sub, num_val)
+                        continue
 
                 for ci, bldg_name in bldg_cols.items():
                     val_str = _row_str(row, ci)
@@ -306,6 +320,27 @@ def parse_building_area_summary(doc):
                     sub_label = current_sub_label or ""
 
                 if in_subitem:
+                    # 分项行功能名为建筑名（如"2 栋"）时，数值集中一列，直接赋给对应建筑
+                    matched_bld = None
+                    if sub_label:
+                        for b in buildings:
+                            if normalize_building_name(b.name) == normalize_building_name(sub_label):
+                                matched_bld = b
+                                break
+                    if matched_bld:
+                        num_val = None
+                        for ci in range(len(row)):
+                            v = d(_row_str(row, ci))
+                            if v is not None:
+                                num_val = v
+                                break
+                        if num_val is not None:
+                            item_key = re.sub(r"\s+", "", sub_label.replace("\n", ""))
+                            if item_key:
+                                item = matched_bld.far_subitems.setdefault(item_key, AreaItem())
+                                setattr(item, sub, num_val)
+                        continue
+
                     for ci, bldg_name in bldg_cols.items():
                         val_str = _row_str(row, ci)
                         if not val_str:
@@ -358,7 +393,26 @@ def parse_planning_indicators(doc):
     indicators = PlanningIndicators()
 
     page_idxs = _find_pages(doc, "规划条件核实指标", start=3)
-    for pidx in page_idxs:
+
+    # 多栋项目可能每栋一张"2-1 规划条件核实指标"表（如 1栋/3栋 各一张）。
+    # 此时各张为单栋指标，累加求和=全项目指标；跳过"（一）项目概况"等汇总页。
+    target_pages = [
+        p for p in page_idxs
+        if "2-1" in doc[p].get_text() and "项目概况" not in doc[p].get_text()
+    ]
+    if not target_pages:
+        target_pages = page_idxs
+
+    def _accumulate(attr, val):
+        cur = getattr(indicators, attr)
+        if val is None:
+            return
+        if cur is None:
+            setattr(indicators, attr, val)
+        else:
+            setattr(indicators, attr, cur + val)
+
+    for pidx in target_pages:
         if not _is_table_page(doc, pidx):
             continue
         tables = _get_tables(doc, pidx)
@@ -370,37 +424,37 @@ def parse_planning_indicators(doc):
                 nums = [d(c) for c in cells if d(c) is not None]
 
                 if "建筑基底面积" in row_joined and len(nums) >= 2:
-                    indicators.base_area_permit = nums[0]
-                    indicators.base_area_measure = nums[1]
+                    _accumulate("base_area_permit", nums[0])
+                    _accumulate("base_area_measure", nums[1])
                     indicators.indicator_page = pidx
                 elif "建筑基底面积" in row_joined and len(nums) == 1:
-                    indicators.base_area_measure = nums[0]
+                    _accumulate("base_area_measure", nums[0])
                     indicators.indicator_page = pidx
 
                 elif "总建筑面积" in row_joined and "计容" not in row_joined:
                     if len(nums) >= 2:
-                        indicators.total_area_permit = nums[0]
-                        indicators.total_area_measure = nums[1]
+                        _accumulate("total_area_permit", nums[0])
+                        _accumulate("total_area_measure", nums[1])
                     elif len(nums) == 1:
-                        indicators.total_area_measure = nums[0]
+                        _accumulate("total_area_measure", nums[0])
                     if indicators.indicator_page < 0:
                         indicators.indicator_page = pidx
 
                 elif "总计容面积" in row_joined:
                     if len(nums) >= 2:
-                        indicators.total_FAR_area_permit = nums[0]
-                        indicators.total_FAR_area_measure = nums[1]
+                        _accumulate("total_FAR_area_permit", nums[0])
+                        _accumulate("total_FAR_area_measure", nums[1])
                     elif len(nums) == 1:
-                        indicators.total_FAR_area_measure = nums[0]
+                        _accumulate("total_FAR_area_measure", nums[0])
 
                 elif "绿化面积" in row_joined and len(nums) >= 2:
-                    indicators.green_area_permit = nums[0]
-                    indicators.green_area_measure = nums[1]
+                    _accumulate("green_area_permit", nums[0])
+                    _accumulate("green_area_measure", nums[1])
 
                 elif "可确权" in row_joined and nums:
-                    indicators.certifiable_area = nums[0]
+                    _accumulate("certifiable_area", nums[0])
                 elif "不可确权" in row_joined and nums:
-                    indicators.non_certifiable_area = nums[0]
+                    _accumulate("non_certifiable_area", nums[0])
 
                 elif "不动产" in row_joined and "总建筑面积" in row_joined and nums:
                     indicators.real_estate_total_area = nums[0]
@@ -492,7 +546,8 @@ def _parse_floor_detail_row(cells, existing, current_floor_ref):
                     current_floor_ref[0].workshop_area = val
                 else:
                     current_floor_ref[0].workshop_area += val
-            elif any(k in area_name for k in ["走廊", "楼梯", "电梯", "门厅", "大堂", "公"]):
+            # 注意：避免用单字符 "公" 匹配（如"服务型公寓"会被误命中归入公建）。
+            elif any(k in area_name for k in ["走廊", "楼梯", "电梯", "门厅", "大堂", "公共", "公用"]):
                 if current_floor_ref[0].public_area is None:
                     current_floor_ref[0].public_area = val
                 else:

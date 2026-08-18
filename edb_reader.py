@@ -80,14 +80,17 @@ class EDBReader:
         return result
 
     def _classify_subitem(self, ftype, fname, item, building):
+        # 与 PDF 解析共用 rules.json 的分项分类规则，保证 EDB/PDF 两侧类别名一致
+        from rules import get_subitem_category
         if ftype == '主要功能':
             building.main_function = item
-        elif ftype == '其他项目':
-            if '屋面' in fname or '梯屋' in fname or '机房' in fname:
+        else:
+            cat = get_subitem_category(fname)
+            if cat == 'roof':
                 building.roof_stair = item
-            elif '配套' in fname or '设施' in fname:
+            elif cat == 'facility':
                 building.facility = item
-            elif '地下' in fname:
+            elif cat == 'basement':
                 building.basement = item
 
     def read_planning_indicators(self):
@@ -224,6 +227,11 @@ class EDBReader:
                 si_list = subitems.get(b.name, [])
                 for ftype, fname, item in si_list:
                     self._classify_subitem(ftype, fname, item, b)
+                    # 同步填入 subitems 字典（使用 EDB 实际功能名称作为 key），
+                    # 使 checker 的 _dynamic_subitems 走 PDF/EDB 同名字典分支，
+                    # 避免 EDB 的"主要功能" vs PDF 的"厂房"名称错位导致误报 PDF缺失。
+                    if fname:
+                        b.subitems[fname] = item
 
             building_names = [b.name for b in buildings]
             floor_tables = self.read_floor_tables(building_names)

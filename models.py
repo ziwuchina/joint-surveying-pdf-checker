@@ -15,11 +15,30 @@ def d(val) -> Optional[Decimal]:
 
 
 def normalize_building_name(name: str) -> str:
-    """统一建筑名称，作为跨表关联的唯一键。"""
+    """统一建筑名称，作为跨表关联的唯一键。
+    处理：空白（半角/全角/换行）、幢→栋、號→号、全角字符转半角。
+    """
     if not name:
         return ""
-    value = str(name).replace("\u3000", "").replace(" ", "").replace("\n", "")
-    return value.replace("幢", "栋").replace("號", "号")
+    value = str(name)
+    # 全角数字/字母 → 半角
+    for fc, hc in [("０", "0"), ("１", "1"), ("２", "2"), ("３", "3"), ("４", "4"),
+                   ("５", "5"), ("６", "6"), ("７", "7"), ("８", "8"), ("９", "9")]:
+        value = value.replace(fc, hc)
+    value = value.replace("\u3000", "").replace(" ", "").replace("\n", "").replace("\t", "")
+    value = value.replace("幢", "栋").replace("號", "号").replace("号楼", "栋")
+    return value
+
+
+def fuzzy_building_key(name: str) -> str:
+    """模糊匹配 key：在 normalize 基础上再去掉尾部量词（栋/座/幢/号楼），
+    使「13栋」「13座」「13 号」等不同命名可互相匹配。
+    """
+    value = normalize_building_name(name)
+    for suffix in ("号楼", "栋", "座", "号", "幢"):
+        if value.endswith(suffix) and len(value) > len(suffix):
+            return value[:-len(suffix)]
+    return value
 
 
 @dataclass

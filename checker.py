@@ -1,5 +1,6 @@
 from decimal import Decimal
 from models import CheckResult, TOL, normalize_building_name, AreaItem
+from rules import get_building_aliases, get_subitem_aliases
 
 FLOOR_TOL = Decimal("0.5")
 
@@ -345,9 +346,12 @@ def check_horizontal(report):
         # --- 分摊说明 vs 分层表 ---
         ap = next((a for a in report.apportionments if a.building_name == ft.building_name), None)
         if ap:
-            compare_inner = ap.summary_inner if ap.summary_inner is not None else ap.total_inner
-            compare_shared = ap.summary_shared if ap.summary_shared is not None else ap.total_shared
-            compare_building = ap.summary_building if ap.summary_building is not None else ap.total_building
+            # 优先用分摊说明主区值（total_*），其与分层表/汇总表同源；
+            # summary_* 是"功能区分摊说明汇总"行的户级舍入值（如地下室 3438.16 vs 分层表 3437.55），
+            # 仅作 fallback，避免 0.01~0.61 ㎡ 的户级舍入差被误报为 FAIL。
+            compare_inner = ap.total_inner if ap.total_inner is not None else ap.summary_inner
+            compare_shared = ap.total_shared if ap.total_shared is not None else ap.summary_shared
+            compare_building = ap.total_building if ap.total_building is not None else ap.summary_building
 
             if compare_inner is not None and ft.total_inner is not None:
                 calc_str = f"分摊说明套内={_fmt(compare_inner)} vs 分层表套内={_fmt(ft.total_inner)}"
@@ -696,8 +700,31 @@ def run_all_checks(report):
 # ==================== EDB对比检查 ====================
 
 def _find_building_by_name(report, name):
+    from models import fuzzy_building_key
+    from rules import get_building_aliases
+
+    norm = normalize_building_name(name)
+    fuzz = fuzzy_building_key(name)
+
+    aliases = get_building_aliases()
+    alias_set = {}
+    for canonical, alias_list in aliases.items():
+        alias_set[normalize_building_name(canonical)] = canonical
+        for a in alias_list:
+            alias_set[normalize_building_name(a)] = canonical
+
+    # 四级匹配：精确(归一化) → 别名 → 去量词模糊 → 包含
+    if norm in alias_set:
+        target = alias_set[norm]
+        for b in report.buildings:
+            if normalize_building_name(b.name) == target:
+                return b
+
     for b in report.buildings:
-        if b.name == name:
+        if normalize_building_name(b.name) == norm:
+            return b
+    for b in report.buildings:
+        if fuzzy_building_key(b.name) == fuzz and fuzz:
             return b
     for b in report.buildings:
         if name in b.name or b.name in name:
@@ -708,19 +735,37 @@ def _find_building_by_name(report, name):
 def check_edb_vs_pdf(pdf_report, edb_report):
     results = []
 
-    edb_names = {b.name for b in edb_report.buildings}
-    pdf_names = {b.name for b in pdf_report.buildings}
+    # 用归一化后的名称做差集，避免 "13 座" vs "13座" 之类的命名差异误报
+    edb_names = {normalize_building_name(b.name) for b in edb_report.buildings}
+    pdf_names = {normalize_building_name(b.name) for b in pdf_report.buildings}
+    edb_to_raw = {normalize_building_name(b.name): b.name for b in edb_report.buildings}
+    pdf_to_raw = {normalize_building_name(b.name): b.name for b in pdf_report.buildings}
 
-    for name in sorted(edb_names - pdf_names):
+    # 别名映射：将别名统一到标准名（用于跨 EDB/PDF 关联）
+    aliases = get_building_aliases()
+    alias_to_canonical = {}
+    for canonical, alias_list in aliases.items():
+        for a in alias_list:
+            alias_to_canonical[normalize_building_name(a)] = canonical
+
+    def _canon(norm_name):
+        return alias_to_canonical.get(norm_name, norm_name)
+
+    edb_canon = {_canon(n) for n in edb_names}
+    pdf_canon = {_canon(n) for n in pdf_names}
+
+    for norm_name in sorted(edb_canon - pdf_canon):
+        raw = edb_to_raw.get(norm_name, norm_name)
         results.append(CheckResult(
-            "EDB对比-完整性", f"EDB建筑「{name}」在PDF中未找到",
+            "EDB对比-完整性", f"EDB建筑「{raw}」在PDF中未找到",
             "fail", "应在PDF中存在", "未找到",
             f"EDB中有此建筑但PDF解析未识别到，可能是建筑名称不匹配或PDF遗漏",
             "建筑面积汇总表", -1))
 
-    for name in sorted(pdf_names - edb_names):
+    for norm_name in sorted(pdf_canon - edb_canon):
+        raw = pdf_to_raw.get(norm_name, norm_name)
         results.append(CheckResult(
-            "EDB对比-完整性", f"PDF建筑「{name}」在EDB中不存在",
+            "EDB对比-完整性", f"PDF建筑「{raw}」在EDB中不存在",
             "warning", "应与EDB一致", "EDB中无此建筑",
             f"PDF中有此建筑但EDB中没有，可能是PDF解析错误识别了不存在的建筑",
             "建筑面积汇总表", -1))
@@ -737,10 +782,25 @@ def check_edb_vs_pdf(pdf_report, edb_report):
         ]
         edb_subs = dict(_dynamic_subitems(edb_b))
         pdf_subs = dict(_dynamic_subitems(pdf_b))
-        all_sub_names = set(edb_subs.keys()) | set(pdf_subs.keys())
+
+        # 分项名称别名统一：EDB/PDF 对同一分项的不同叫法（如"公交首末站"vs"公共服务设施"）
+        # 先各自归一，再合并比较
+        sub_aliases = get_subitem_aliases()
+        sub_alias_map = {}
+        for canonical, alias_list in sub_aliases.items():
+            sub_alias_map[canonical] = canonical
+            for a in alias_list:
+                sub_alias_map[a] = canonical
+
+        def _sub_key(k):
+            return sub_alias_map.get(k, k)
+
+        edb_subs_n = {_sub_key(k): v for k, v in edb_subs.items()}
+        pdf_subs_n = {_sub_key(k): v for k, v in pdf_subs.items()}
+        all_sub_names = set(edb_subs_n.keys()) | set(pdf_subs_n.keys())
         for name in sorted(all_sub_names):
-            edb_item = edb_subs.get(name)
-            pdf_item = pdf_subs.get(name)
+            edb_item = edb_subs_n.get(name)
+            pdf_item = pdf_subs_n.get(name)
             if edb_item is not None or pdf_item is not None:
                 checks.append((name, edb_item or AreaItem(), pdf_item or AreaItem()))
 
